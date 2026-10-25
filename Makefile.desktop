@@ -1,0 +1,6 @@
+# Desktop simulator (needs SDL2):  make -f Makefile.desktop && ./kruczek_sim
+CFLAGS ?= -O2 -Wall
+kruczek_sim: src/game.c src/gfx.c src/audio.c src/platform_sdl.c
+	$(CC) $(CFLAGS) -DKR_BOT $^ -o $@ $(shell pkg-config --cflags --libs sdl2) -lm
+clean:
+	rm -f kruczek_sim
