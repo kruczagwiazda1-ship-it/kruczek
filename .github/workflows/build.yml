@@ -6,10 +6,17 @@ jobs:
     container: devkitpro/devkitppc:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Wii U libraries
+      - name: Install Wii U libraries (retries - the devkitPro server sometimes answers 403)
         run: |
-          dkp-pacman -Syu --noconfirm
-          dkp-pacman -S --noconfirm wiiu-dev
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            if dkp-pacman -Syu --noconfirm && dkp-pacman -S --noconfirm wiiu-dev; then ok=1; break; fi
+            echo "Attempt $i failed, waiting..."; sleep 45
+          done
+          if [ "$ok" != "1" ]; then
+            echo "Trying without database sync..."
+            dkp-pacman -S --noconfirm wiiu-dev
+          fi
       - name: Build
         run: make
       - uses: actions/upload-artifact@v4
