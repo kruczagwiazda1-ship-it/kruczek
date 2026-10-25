@@ -60,3 +60,9 @@ the game still runs), and WUP Installer GX2 needs a console with signature check
    without it NUSPacker writes a placeholder key and the package installs but will not boot).
 5. Copy the output title folder to `SD:/install/`, run WUP Installer GX2, install to **USB**, not NAND.
 The XML templates and the install flow are untested here.
+
+
+## What each screen shows (v2)
+- GamePad only: enemy burrows (they flash before enemies climb out) and buried treasure (gold X). Resources and the build bar.
+- TV only: rich soil (gold glow - build there for bonuses), enemy health bars, treasure digging progress.
+- First start runs a short tutorial; "How to play" is in the title and pause menus.

@@ -8,6 +8,9 @@ typedef struct { uint32_t *px; int w, h; } Fb;
 #define RGB(r,g,b) RGBA(r,g,b,255)
 #define WITH_A(c,a) (((c)&0xFFFFFF00u)|((uint32_t)(a)))
 
+void gfx_set_lowq(int q);              /* 1 = cheap mode: no ink outlines */
+int  gfx_lowq(void);
+float fsq(float x);                    /* fast sqrt (no libm) */
 void gfx_set_alpha(float a);
 void gfx_set_outline(float w, uint32_t col);  /* >0: every opaque shape gets a dark ink outline */
 enum { FONT_UI = 0, FONT_DISPLAY = 1 };

@@ -13,12 +13,14 @@ typedef float (*GenFn)(float t, float u, Syn *s);
 static uint32_t rng = 12345;
 static float rnd(void) { rng = rng * 1664525u + 1013904223u; return ((rng >> 9) & 0xFFFF) / 32768.f - 1.f; }
 
+#define STBL 2048
+static float sin_tbl[STBL + 1]; static int tbl_ok = 0;
 enum { W_SIN, W_SQR, W_SAW, W_TRI, W_PUL };
 static float osc(Syn *s, int k, float f, int type) {
     s->ph[k] += f / AUDIO_RATE; if (s->ph[k] >= 1.f) s->ph[k] -= floorf(s->ph[k]);
     float p = s->ph[k];
     switch (type) {
-        case W_SIN: return sinf(p * TAU);
+        case W_SIN: return sin_tbl[(int)(p * STBL)];
         case W_SQR: return p < .5f ? 1.f : -1.f;
         case W_SAW: return 2.f * p - 1.f;
         case W_TRI: return 4.f * fabsf(p - .5f) - 1.f;
@@ -96,6 +98,7 @@ static int sfx_on = 1, music_on = 1;
 static float intensity_target = .2f, intensity = .2f;
 
 void audio_init(void) {
+    if (!tbl_ok) { for (int i = 0; i <= STBL; i++) sin_tbl[i] = sinf((float)i / STBL * TAU); tbl_ok = 1; }
     for (int i = 0; i < NVOICE; i++) voices[i].id = -1;
     for (int i = 0; i < S_COUNT; i++) {
         int n = (int)(defs[i].dur * AUDIO_RATE);
@@ -130,12 +133,16 @@ static const int chord_fifth[16] = { 7,7,7,7, 7,7,7,7, 7,7,7,7, 7,7,7,7 };
 static const int lead_a[16] = { 4,0,3,0,2,0,3,4, 0,5,4,0,3,0,2,0 };
 static const int lead_b[16] = { 0,4,0,5,4,3,0,2, 3,0,4,0,5,0,4,3 };
 
-static double mt = 0; static float mph[10]; static float hat_lp, kick_ph, snare_lp;
+/* Music engine: everything per-sample is table lookups and multiplies (the Wii U CPU has no
+ * fast libm). Note frequencies and envelope constants are computed once per step. */
+static inline float tsin(float ph) { float x = ph * STBL; int i = (int)x; float fr = x - i; return sin_tbl[i] + (sin_tbl[i + 1] - sin_tbl[i]) * fr; }
+static double mt = 0; static float mph[10]; static float hat_lp, kick_ph, snare_lp, vib_ph;
 static float dl[2][12000]; static int dlpos = 0; static const int DLEN = (int)(AUDIO_RATE * .36f);
 static float mtof(float m) { return 440.f * powf(2.f, (m - 69) / 12.f); }
-static float pul(float *ph, float f, float duty) { *ph += f / AUDIO_RATE; if (*ph >= 1) *ph -= 1; return *ph < duty ? 1.f : -1.f; }
-static float tri(float *ph, float f) { *ph += f / AUDIO_RATE; if (*ph >= 1) *ph -= 1; return 4.f * fabsf(*ph - .5f) - 1.f; }
-static float sine(float *ph, float f) { *ph += f / AUDIO_RATE; if (*ph >= 1) *ph -= 1; return sinf(*ph * TAU); }
+static inline float adv(float *ph, float f) { *ph += f * (1.f / AUDIO_RATE); if (*ph >= 1) *ph -= 1; return *ph; }
+static inline float pul(float *ph, float f, float duty) { return adv(ph, f) < duty ? 1.f : -1.f; }
+static inline float tri(float *ph, float f) { return 4.f * fabsf(adv(ph, f) - .5f) - 1.f; }
+static inline float sine(float *ph, float f) { return tsin(adv(ph, f)); }
 
 static float lead_note(int bar, int step, int *deg) {
     const int *ph = (bar / 2) % 2 == 0 ? lead_a : lead_b;
@@ -144,55 +151,60 @@ static float lead_note(int bar, int step, int *deg) {
     switch (d) { case 1: return r; case 2: return r + chord_third[bar]; case 3: return r + 7; case 4: return r + 12; default: return r + 14; }
 }
 
+#define DEC(rate) (1.f - (rate) / AUDIO_RATE)         /* cheap per-sample exponential decay factor */
+static int last_step = -1;
+static float f_pad[4], f_bass, f_arp, f_lead; static int has_bass, has_arp, has_lead, has_kick, has_snare;
+static float e_bass, e_arp, e_lead, e_kick, e_kf, e_snare, e_hat, hat_amp, lt_acc;
+
 static void music_sample(float *outL, float *outR) {
     float step_len = 60.f / BPM / 2.f;
     mt += 1.0 / AUDIO_RATE;
     double total = 16 * 8 * step_len; if (mt >= total) mt -= total;
-    int gstep = (int)(mt / step_len); float lt = (float)(mt - gstep * step_len);
+    int gstep = (int)(mt / step_len);
     int bar = gstep / 8, step = gstep % 8;
     intensity += (intensity_target - intensity) * (1.f / (AUDIO_RATE * 1.2f));
     int battle = intensity > .5f;
-    float root = (float)chord_root[bar], third = root + chord_third[bar], fifth = root + chord_fifth[bar];
+
+    if (gstep != last_step) {                      /* new 8th-note step: recompute everything once */
+        last_step = gstep; lt_acc = 0;
+        float root = (float)chord_root[bar], third = root + chord_third[bar], fifth = root + chord_fifth[bar];
+        f_pad[0] = mtof(root + 12); f_pad[1] = mtof(third + 12); f_pad[2] = mtof(fifth + 12); f_pad[3] = mtof(root);
+        static const int bass_pat[8] = { 1,0,0,1,1,0,1,0 };
+        has_bass = bass_pat[step]; f_bass = mtof(root - 12 + ((step == 6) ? 7 : 0)); if (has_bass) e_bass = 1.f;
+        static const int arp[8] = { 0,1,2,1,0,2,1,2 };
+        float an = arp[step] == 0 ? root + 12 : (arp[step] == 1 ? third + 12 : fifth + 12);
+        has_arp = (step % 2 == 0 || battle); f_arp = mtof(an + 12); e_arp = 1.f;
+        int deg; float ln = lead_note(bar, step, &deg); has_lead = deg; if (deg) { f_lead = mtof(ln); e_lead = 1.f; }
+        has_kick = (step == 0 || step == 4 || (step == 3 && (bar % 2))); if (has_kick) { e_kick = 1.f; e_kf = 1.f; }
+        has_snare = (step == 2 || step == 6); if (has_snare) e_snare = 1.f;
+        e_hat = 1.f; hat_amp = (step % 2) ? .06f : .035f;
+    }
+    lt_acc += 1.f / AUDIO_RATE;
     float v = 0, lead = 0;
 
-    /* pad: soft chord, always */
     float padg = .035f;
-    v += (tri(&mph[0], mtof(root + 12)) + tri(&mph[1], mtof(third + 12)) + tri(&mph[2], mtof(fifth + 12))) * padg;
-    v += sine(&mph[3], mtof(root)) * .03f;
+    v += (tri(&mph[0], f_pad[0]) + tri(&mph[1], f_pad[1]) + tri(&mph[2], f_pad[2])) * padg;
+    v += sine(&mph[3], f_pad[3]) * .03f;
 
-    /* bass: plucked eighths */
-    static const int bass_pat[8] = { 1,0,0,1,1,0,1,0 };
-    if (bass_pat[step]) {
-        float f = mtof(root - 12 + ((step == 6) ? 7 : 0));
-        v += (sine(&mph[4], f) * .8f + tri(&mph[5], f * 2) * .2f) * expf(-lt * 5.f) * (battle ? .24f : .18f);
-    }
-    /* arpeggio pluck */
-    static const int arp[8] = { 0,1,2,1,0,2,1,2 };
-    float an = arp[step] == 0 ? root + 12 : (arp[step] == 1 ? third + 12 : fifth + 12);
-    if (step % 2 == 0 || battle) v += (sine(&mph[6], mtof(an + 12)) * .7f + tri(&mph[7], mtof(an + 12)) * .3f) * expf(-lt * 9.f) * .075f;
+    if (has_bass) { v += (sine(&mph[4], f_bass) * .8f + tri(&mph[5], f_bass * 2) * .2f) * e_bass * (battle ? .24f : .18f); e_bass *= DEC(5.f); }
+    if (has_arp)  { v += (sine(&mph[6], f_arp) * .7f + tri(&mph[7], f_arp) * .3f) * e_arp * .075f; e_arp *= DEC(9.f); }
 
-    /* lead: always in battle, soft in calm */
-    int deg; float ln = lead_note(bar, step, &deg);
-    if (deg) {
-        float f = mtof(ln) * (1.f + sinf((float)mt * 5.5f) * .004f);
-        float e = expf(-lt * 3.2f) * fminf(lt / .01f, 1.f);
-        lead = (pul(&mph[8], f, .3f) * .5f + sine(&mph[9], f) * .5f) * e * (battle ? .09f : .045f);
+    if (has_lead) {
+        float vib = 1.f + tsin(adv(&vib_ph, .875f)) * .004f;        /* ~5.5 rad/s */
+        float f = f_lead * vib;
+        float att = lt_acc < .01f ? lt_acc * 100.f : 1.f;
+        lead = (pul(&mph[8], f, .3f) * .5f + sine(&mph[9], f) * .5f) * e_lead * att * (battle ? .09f : .045f);
+        e_lead *= DEC(3.2f);
         v += lead;
     }
-    /* drums (battle) */
     if (battle) {
-        if (step == 0 || step == 4 || (step == 3 && (bar % 2))) { /* kick */
-            float kf = 110.f * expf(-lt * 18.f) + 42.f; kick_ph += kf / AUDIO_RATE; if (kick_ph > 1) kick_ph -= 1;
-            v += sinf(kick_ph * TAU) * expf(-lt * 11.f) * .32f;
-        }
-        if (step == 2 || step == 6) { float n = rnd(); lpf(&snare_lp, n, .5f); v += (n - snare_lp) * expf(-lt * 18.f) * .12f; }
-        float n = rnd(); hat_lp += (n - hat_lp) * .6f; v += (n - hat_lp) * expf(-lt * 45.f) * (step % 2 ? .06f : .035f);
+        if (has_kick) { kick_ph += (110.f * e_kf + 42.f) * (1.f / AUDIO_RATE); if (kick_ph > 1) kick_ph -= 1; v += tsin(kick_ph) * e_kick * .32f; e_kf *= DEC(18.f); e_kick *= DEC(11.f); }
+        if (has_snare) { float n = rnd(); snare_lp += (n - snare_lp) * .5f; v += (n - snare_lp) * e_snare * .12f; e_snare *= DEC(18.f); }
+        float n = rnd(); hat_lp += (n - hat_lp) * .6f; v += (n - hat_lp) * e_hat * hat_amp; e_hat *= DEC(45.f);
     }
     v *= .85f;
-    /* stereo ping-pong delay on everything melodic */
     float dr = dl[0][dlpos], dr2 = dl[1][dlpos];
-    int wp = (dlpos + DLEN) % 12000; (void)wp;
-    dl[1][dlpos] = lead * 1.0f + dr * .42f; dl[0][dlpos] = (v - lead) * .12f + dr2 * .42f + lead * .0f;
+    dl[1][dlpos] = lead * 1.0f + dr * .42f; dl[0][dlpos] = (v - lead) * .12f + dr2 * .42f;
     dlpos++; if (dlpos >= DLEN) dlpos = 0;
     *outL = v + dr * .8f; *outR = v + dr2 * .8f;
 }

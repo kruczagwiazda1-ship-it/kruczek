@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define AUDIO_RATE 32000
+#define AUDIO_RATE 24000
 
 enum {
     S_SHOOT, S_HIT, S_KILL, S_CAW, S_DASH, S_COIN, S_SPARK, S_BUILD, S_DENY, S_HURT,

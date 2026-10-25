@@ -26,6 +26,8 @@ int plat_save(const void *buf, int size);
 void game_init(void);
 void game_update(const Input *in, float dt);
 void game_render(Fb *tv, Fb *pad);
+void game_render_tv(Fb *tv);
+void game_render_pad(Fb *pad);
 int  game_quit(void);
 void game_save(void);
 #ifdef KR_BOT

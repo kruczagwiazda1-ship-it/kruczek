@@ -91,13 +91,31 @@ static void screen_init(Scr *s, OSScreenID id, int w, int h) {
     OSScreenClearBufferEx(id, 0); OSScreenFlipBuffersEx(id); OSScreenClearBufferEx(id, 0); OSScreenFlipBuffersEx(id);
 }
 
+/* Fast present: no per-pixel division. Column map is built once; rows that map to the same source row
+ * are copied from the previous output row with memcpy. */
+static int *xmap_for(const Scr *s, const Fb *fb, int *cache_w, int *cache_fw, int **cache) {
+    if (*cache && *cache_w == s->w && *cache_fw == fb->w) return *cache;
+    free(*cache); *cache = (int *)malloc(sizeof(int) * s->w);
+    for (int x = 0; x < s->w; x++) (*cache)[x] = x * fb->w / s->w;
+    *cache_w = s->w; *cache_fw = fb->w; return *cache;
+}
 static void screen_present(Scr *s, const Fb *fb) {
     if (s->ok) {
+        static int *xm[2]; static int xw[2], xf[2];
+        int k = (s->id == SCREEN_TV) ? 0 : 1;
+        int *xmap = xmap_for(s, fb, &xw[k], &xf[k], &xm[k]);
         uint32_t *dst = s->base[s->cur];
+        int prev = -1; uint32_t *pd = NULL;
         for (int y = 0; y < s->h; y++) {
-            const uint32_t *row = fb->px + (size_t)(y * fb->h / s->h) * fb->w; uint32_t *d = dst + (size_t)y * s->pitch;
-            if (s->w == fb->w) memcpy(d, row, (size_t)fb->w * 4);
-            else for (int x = 0; x < s->w; x++) d[x] = row[x * fb->w / s->w];
+            int sy = (y * fb->h) / s->h;
+            uint32_t *d = dst + (size_t)y * s->pitch;
+            if (sy == prev && pd) { memcpy(d, pd, (size_t)s->w * 4); }
+            else {
+                const uint32_t *row = fb->px + (size_t)sy * fb->w;
+                if (s->w == fb->w) memcpy(d, row, (size_t)fb->w * 4);
+                else for (int x = 0; x < s->w; x++) d[x] = row[xmap[x]];
+            }
+            prev = sy; pd = d;
         }
         DCFlushRange(dst, (uint32_t)s->pitch * s->h * 4);
         OSScreenFlipBuffersEx(s->id);
@@ -161,9 +179,11 @@ int main(int argc, char **argv) {
         OSTime now = OSGetSystemTime();
         float dt = (float)(now - last) / (float)OSTimerClockSpeed; last = now;
         game_update(&in, dt);
-        game_render(&tv, &pad);
+        /* TV every frame, GamePad every other frame (the pad image is smaller and changes less) */
+        static unsigned frameNo = 0; frameNo++;
+        game_render_tv(&tv);
         screen_present(&tvs, &tv);
-        screen_present(&pads, &pad);
+        if ((frameNo & 1) == 0) { game_render_pad(&pad); screen_present(&pads, &pad); }
     }
     game_save();
     if (ad) SDL_CloseAudioDevice(ad);

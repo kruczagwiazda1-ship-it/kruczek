@@ -29,7 +29,7 @@
 enum { R_STICK, R_STONE, R_SHINY, R_N };
 enum { B_HOLE, B_HOUSE, B_PICNIC, B_FIRE, B_TOWER, B_GARDEN, B_N };
 enum { E_RAT, E_SNAKE, E_CAT, E_FOX };
-enum { MODE_TITLE, MODE_PLAY, MODE_PAUSE };
+enum { MODE_TITLE, MODE_PLAY, MODE_PAUSE, MODE_HELP };
 enum { WS_BREAK, WS_FIGHT, WS_CLEAR };
 
 static const char *BNAME[B_N] = { "Hole", "House", "Picnic", "Campfire", "Tower", "Garden" };
@@ -48,8 +48,10 @@ static const uint32_t RCOL[R_N] = { RGB(176, 118, 66), RGB(158, 168, 180), RGB(2
 typedef struct {
     uint32_t magic; int32_t res[R_N]; int8_t grid[GROWS][GCOLS];
     int32_t wave, cleared, sound, music;
+    int8_t soil[GROWS][GCOLS];      /* rich soil cells - drawn only on the TV */
+    int32_t tutDone;
 } Save;
-#define SAVE_MAGIC 0x4B525A33u
+#define SAVE_MAGIC 0x4B525A34u
 
 typedef struct {
     float x, y, hp, maxhp, face, iframes, dashT, dashCd, cawCd, atkCd, fireBuff, anim, flash, dx, dy;
@@ -57,8 +59,10 @@ typedef struct {
 } Player;
 typedef struct {
     int alive, type; float x, y, vx, vy, hp, maxhp, r, flash, t, stuck, holeImm, face, burn;
-    int st; float stT, dirx, diry; float seg[7][2];
+    int st; float stT, dirx, diry; float seg[7][2]; float emerge;
 } Enemy;
+typedef struct { int alive, type; float x, y, t, total; } Warn;      /* burrow warning: GamePad shows it early */
+typedef struct { int alive; float x, y, prog; } Treasure;            /* buried loot: GamePad shows the X, TV shows digging */
 typedef struct { int alive, kind; float x, y, vx, vy, dmg, life; int pierce; } Shot;
 typedef struct { int alive, kind; float x, y, life, t; } Drop;
 typedef struct { int alive, kind, state; float x, y, vy, ttl, t, fx, fy; } Fall;
@@ -71,11 +75,13 @@ typedef struct { int alive, pad, size; float x, y, vy, life, max; uint32_t col; 
 #define NF 40
 #define NP 500
 #define NT 40
+#define NW 24
+#define NTR 3
 
 static struct {
     Save sv; int hasSave;
     int mode, msel, quit;
-    Player p; Enemy en[NE]; Shot sh[NS]; Drop dr[ND]; Fall fl[NF]; Part pt[NP]; FText ft[NT];
+    Player p; Enemy en[NE]; Shot sh[NS]; Drop dr[ND]; Fall fl[NF]; Part pt[NP]; FText ft[NT]; Warn wn[NW]; Treasure tr[NTR];
     float ct[GROWS][GCOLS]; float cpop[GROWS][GCOLS];
     int wstate; float wtimer, spawnT; int toSpawn, bossLeft, enemiesSeen;
     float dead, bannerT, unlockT, infoT, hurtFlash, cawFx, tvTime, padTime, saveT, holeSnd, hintCount;
@@ -84,6 +90,7 @@ static struct {
     float cx, cy, curShow; float lastTouchX, lastTouchY, touchFlash; int lastCellR, lastCellC;
     uint32_t prevHold; int prevTouch; int firstTouchFrame;
     int maxhp;
+    int tut; float tutT, tutDist; int tutKills, tutBuilt, tutDug, tutCaught; int helpFrom;
 } G;
 
 /* ---------------- helpers ---------------- */
@@ -119,21 +126,19 @@ static void new_game_data(void) {
     memset(&G.sv, 0, sizeof G.sv); G.sv.magic = SAVE_MAGIC;
     memset(G.sv.grid, -1, sizeof G.sv.grid);
     G.sv.res[R_STICK] = 6; G.sv.wave = 1; G.sv.cleared = 0; G.sv.sound = snd; G.sv.music = mus;
+    for (int n = 0; n < 9; ) { int r = rand() % GROWS, c = rand() % GCOLS; if (G.sv.soil[r][c]) continue; G.sv.soil[r][c] = 1; n++; }
 }
+static int rich_at(int r, int c) { return G.sv.soil[r][c] != 0; }
 
 /* ---------------- resources ---------------- */
 static int can_afford(int b) { for (int i = 0; i < R_N; i++) if (G.sv.res[i] < BCOST[b][i]) return 0; return 1; }
 
 /* ---------------- spawn ---------------- */
 static float hp_scale(void) { return 1.f + 0.11f * (G.sv.wave - 1); }
-static void spawn_enemy(int type) {
+static void spawn_enemy_at(int type, float x, float y) {
     for (int i = 0; i < NE; i++) if (!G.en[i].alive) {
         Enemy *e = &G.en[i]; memset(e, 0, sizeof *e); e->alive = 1; e->type = type;
-        int side = rand() % 4; float x, y;
-        if (type == E_FOX) { side = rand() % 2; }
-        if (side == 0) { x = AX - 40; y = frange(AY, AY + AH); } else if (side == 1) { x = AX + AW + 40; y = frange(AY, AY + AH); }
-        else if (side == 2) { x = frange(AX, AX + AW); y = AY - 40; } else { x = frange(AX, AX + AW); y = AY + AH + 40; }
-        e->x = x; e->y = y; e->face = 1;
+        e->x = x; e->y = y; e->face = 1; e->emerge = .6f;
         switch (type) {
             case E_RAT:   e->maxhp = 14; e->r = 15; break;
             case E_SNAKE: e->maxhp = 9;  e->r = 12; break;
@@ -141,9 +146,42 @@ static void spawn_enemy(int type) {
             default:      e->maxhp = 260; e->r = 40; break;
         }
         e->maxhp *= (type == E_FOX ? 1.f + 0.16f * (G.sv.wave / 5 - 1) : hp_scale()); e->hp = e->maxhp;
-        for (int s = 0; s < 7; s++) { e->seg[s][0] = x; e->seg[s][1] = y; }
+        for (int k = 0; k < 7; k++) { e->seg[k][0] = x; e->seg[k][1] = y; }
         e->t = frand() * 10; e->stT = 2.5f;
         return;
+    }
+}
+/* Enemies come out of fixed burrows INSIDE the arena. The burrows are only drawn on the GamePad. */
+#define NBURROW 8
+static const float BURROW[NBURROW][2] = {
+    { AX + 90, AY + 80 }, { AX + AW / 2, AY + 70 }, { AX + AW - 90, AY + 80 }, { AX + 80, AY + AH / 2 },
+    { AX + AW - 80, AY + AH / 2 }, { AX + 90, AY + AH - 70 }, { AX + AW / 2, AY + AH - 60 }, { AX + AW - 90, AY + AH - 70 } };
+static void queue_spawn(int type, float delay) {
+    int best = -1;
+    for (int tries = 0; tries < 12; tries++) {
+        int k = rand() % NBURROW; float dx = BURROW[k][0] - G.p.x, dy = BURROW[k][1] - G.p.y;
+        if (dx * dx + dy * dy > 260.f * 260.f) { best = k; break; }
+        if (best < 0) best = k;
+    }
+    for (int i = 0; i < NW; i++) if (!G.wn[i].alive) {
+        Warn *w = &G.wn[i]; w->alive = 1; w->type = type; w->t = w->total = delay;
+        w->x = BURROW[best][0] + frange(-18, 18); w->y = BURROW[best][1] + frange(-14, 14); return;
+    }
+}
+static int warns_left(void) { int n = 0; for (int i = 0; i < NW; i++) if (G.wn[i].alive) n++; return n; }
+static int treasures_left(void) { int n = 0; for (int i = 0; i < NTR; i++) if (G.tr[i].alive) n++; return n; }
+static void spawn_treasures(int want) {
+    while (treasures_left() < want) {
+        int slot = -1; for (int i = 0; i < NTR; i++) if (!G.tr[i].alive) { slot = i; break; }
+        if (slot < 0) return;
+        float x = 0, y = 0;
+        for (int tries = 0; tries < 30; tries++) {
+            x = frange(AX + 110, AX + AW - 110); y = frange(AY + 90, AY + AH - 80);
+            float dx = x - G.p.x, dy = y - G.p.y; int ok = dx * dx + dy * dy > 220.f * 220.f;
+            for (int j = 0; j < NTR; j++) if (G.tr[j].alive) { float ox = x - G.tr[j].x, oy = y - G.tr[j].y; if (ox * ox + oy * oy < 200.f * 200.f) ok = 0; }
+            if (ok) break;
+        }
+        G.tr[slot].alive = 1; G.tr[slot].x = x; G.tr[slot].y = y; G.tr[slot].prog = 0;
     }
 }
 static void spawn_drop(int kind, float x, float y, float life) {
@@ -179,7 +217,7 @@ static void drop_loot(Enemy *e) {
     if (frand() < .06f) spawn_drop(3, x - 10, y + 8, 12);
 }
 static void kill_enemy(Enemy *e) {
-    e->alive = 0; sfx_play(S_KILL, 1.f);
+    e->alive = 0; G.tutKills++; sfx_play(S_KILL, 1.f);
     uint32_t col = e->type == E_CAT ? RGB(240, 150, 70) : e->type == E_SNAKE ? RGB(110, 190, 90) : e->type == E_FOX ? RGB(230, 110, 50) : RGB(160, 160, 170);
     burst(0, e->x, e->y, e->type == E_FOX ? 40 : 14, 220, col, 5.5f, .6f);
     add_ft(0, e->x, e->y - e->r, e->type == E_FOX ? "FOX DEFEATED!" : "poof!", RGB(255, 255, 255), e->type == E_FOX ? 30 : 20);
@@ -193,6 +231,7 @@ static void die(void) {
     G.dead = 3.4f; sfx_play(S_FAIL, 1.f);
     burst(0, G.p.x, G.p.y, 40, 260, RGB(40, 44, 70), 6, .9f);
     for (int i = 0; i < NE; i++) G.en[i].alive = 0;
+    for (int i = 0; i < NW; i++) G.wn[i].alive = 0;
     for (int i = 0; i < NS; i++) G.sh[i].alive = 0;
     for (int i = 0; i < ND; i++) G.dr[i].alive = 0;
     for (int i = 0; i < R_N; i++) G.sv.res[i] -= G.sv.res[i] / 4;
@@ -217,7 +256,7 @@ static void wave_cleared(void) {
     int old = G.sv.cleared;
     if (G.sv.wave > G.sv.cleared) G.sv.cleared = G.sv.wave;
     G.sv.wave++; G.wstate = WS_BREAK; G.wtimer = 9.f;
-    G.p.hp = fminf(G.maxhp, G.p.hp + G.maxhp * .35f); sfx_play(S_HEAL, 1.f);
+    G.p.hp = fminf(G.maxhp, G.p.hp + G.maxhp * .35f); sfx_play(S_HEAL, 1.f); spawn_treasures(2);
     for (int b = 0; b < B_N; b++) if (BREQ[b] > old && BREQ[b] <= G.sv.cleared) { G.unlockB = b; G.unlockT = 4.5f; sfx_play(S_UNLOCK, 1.f); }
     game_save();
 }
@@ -240,14 +279,15 @@ static void try_build(int r, int c) {
     if (!can_afford(b)) { sfx_play(S_DENY, 1.f); add_ft(1, padx(cx), pady(cy), "not enough loot", RGB(255, 140, 140), 16); return; }
     for (int i = 0; i < R_N; i++) G.sv.res[i] -= BCOST[b][i];
     G.sv.grid[r][c] = (int8_t)b; G.cpop[r][c] = 0; G.ct[r][c] = (b == B_HOLE) ? frange(8, 14) : (b == B_GARDEN ? 3.f : 0.4f);
-    sfx_play(S_BUILD, 1.f);
+    sfx_play(S_BUILD, 1.f); G.tutBuilt = 1;
+    if (rich_at(r, c)) { add_ft(1, padx(cx), pady(cy) - 38, "Rich soil bonus!", RGB(255, 226, 110), 17); add_ft(0, cx, cy - 78, "Rich soil bonus!", RGB(255, 226, 110), 22); }
     burst(0, cx, cy + 10, 18, 190, RGB(210, 180, 130), 6, .6f); burst(1, padx(cx), pady(cy) + 6, 12, 110, RGB(210, 180, 130), 3.5f, .5f);
     add_ft(0, cx, cy - 50, "NEW!", RGB(255, 235, 120), 26); add_ft(1, padx(cx), pady(cy) - 20, "built!", RGB(255, 235, 120), 16);
     game_save();
 }
 
 static void catch_fall(Fall *f) {
-    int inair = f->state == 0;
+    int inair = f->state == 0; G.tutCaught = 1;
     int amt = 1;
     G.combo++; G.comboT = 6.f;
     if (G.combo >= 5) { amt++; }
@@ -260,21 +300,23 @@ static void catch_fall(Fall *f) {
 }
 
 /* ---------------- menus ---------------- */
-static int menu_count(void) { return G.mode == MODE_TITLE ? 5 : 4; }
+static int menu_count(void) { return G.mode == MODE_TITLE ? 6 : 5; }
 static void menu_label(int i, char *out, int n) {
     if (G.mode == MODE_TITLE) {
         switch (i) {
             case 0: snprintf(out, n, "%s", G.hasSave ? "Continue" : "Play"); break;
             case 1: snprintf(out, n, "New game"); break;
-            case 2: snprintf(out, n, "Sound: %s", G.sv.sound ? "ON" : "OFF"); break;
-            case 3: snprintf(out, n, "Music: %s", G.sv.music ? "ON" : "OFF"); break;
+            case 2: snprintf(out, n, "How to play"); break;
+            case 3: snprintf(out, n, "Sound: %s", G.sv.sound ? "ON" : "OFF"); break;
+            case 4: snprintf(out, n, "Music: %s", G.sv.music ? "ON" : "OFF"); break;
             default: snprintf(out, n, "Quit"); break;
         }
     } else {
         switch (i) {
             case 0: snprintf(out, n, "Resume"); break;
-            case 1: snprintf(out, n, "Sound: %s", G.sv.sound ? "ON" : "OFF"); break;
-            case 2: snprintf(out, n, "Music: %s", G.sv.music ? "ON" : "OFF"); break;
+            case 1: snprintf(out, n, "How to play"); break;
+            case 2: snprintf(out, n, "Sound: %s", G.sv.sound ? "ON" : "OFF"); break;
+            case 3: snprintf(out, n, "Music: %s", G.sv.music ? "ON" : "OFF"); break;
             default: snprintf(out, n, "Save and exit to menu"); break;
         }
     }
@@ -282,31 +324,42 @@ static void menu_label(int i, char *out, int n) {
 static void reset_world(void) {
     memset(G.en, 0, sizeof G.en); memset(G.sh, 0, sizeof G.sh); memset(G.dr, 0, sizeof G.dr);
     memset(G.fl, 0, sizeof G.fl); memset(G.pt, 0, sizeof G.pt); memset(G.ft, 0, sizeof G.ft);
-    memset(G.ct, 0, sizeof G.ct); memset(G.cpop, 0, sizeof G.cpop);
+    memset(G.ct, 0, sizeof G.ct); memset(G.cpop, 0, sizeof G.cpop); memset(G.wn, 0, sizeof G.wn); memset(G.tr, 0, sizeof G.tr);
     memset(&G.p, 0, sizeof G.p); G.p.x = AX + AW / 2; G.p.y = AY + AH / 2; G.p.face = 1;
     G.maxhp = 100; G.p.hp = 100; G.p.maxhp = 100;
     G.wstate = WS_BREAK; G.wtimer = 8.f; G.dead = 0; G.unlockT = 0; G.combo = 0; G.sel = 0; G.demolish = 0;
     G.cx = PADW / 2; G.cy = 200;
 }
+static void begin_play(int fresh) {
+    reset_world(); G.mode = MODE_PLAY;
+    G.tut = G.sv.tutDone ? 6 : 0; G.tutT = 0; G.tutDist = 0; G.tutKills = 0; G.tutBuilt = 0; G.tutDug = 0; G.tutCaught = 0;
+    if (G.tut == 6) { spawn_treasures(2); banner(fresh ? "New game - good luck!" : "Welcome back!", 0); }
+}
 static void menu_activate(int i) {
     sfx_play(S_UI, 1.f);
     if (G.mode == MODE_TITLE) {
-        if (i == 0) { reset_world(); G.mode = MODE_PLAY; banner("Build something on the GamePad!", 0); }
-        else if (i == 1) { new_game_data(); game_save(); reset_world(); G.mode = MODE_PLAY; banner("New game - build something on the GamePad!", 0); }
-        else if (i == 2) { G.sv.sound = !G.sv.sound; audio_set_enabled(G.sv.sound, G.sv.music); }
-        else if (i == 3) { G.sv.music = !G.sv.music; audio_set_enabled(G.sv.sound, G.sv.music); }
+        if (i == 0) begin_play(0);
+        else if (i == 1) { new_game_data(); game_save(); begin_play(1); }
+        else if (i == 2) { G.helpFrom = MODE_TITLE; G.mode = MODE_HELP; }
+        else if (i == 3) { G.sv.sound = !G.sv.sound; audio_set_enabled(G.sv.sound, G.sv.music); }
+        else if (i == 4) { G.sv.music = !G.sv.music; audio_set_enabled(G.sv.sound, G.sv.music); }
         else { game_save(); G.quit = 1; }
     } else {
         if (i == 0) G.mode = MODE_PLAY;
-        else if (i == 1) { G.sv.sound = !G.sv.sound; audio_set_enabled(G.sv.sound, G.sv.music); }
-        else if (i == 2) { G.sv.music = !G.sv.music; audio_set_enabled(G.sv.sound, G.sv.music); }
+        else if (i == 1) { G.helpFrom = MODE_PAUSE; G.mode = MODE_HELP; }
+        else if (i == 2) { G.sv.sound = !G.sv.sound; audio_set_enabled(G.sv.sound, G.sv.music); }
+        else if (i == 3) { G.sv.music = !G.sv.music; audio_set_enabled(G.sv.sound, G.sv.music); }
         else { game_save(); G.mode = MODE_TITLE; G.msel = 0; }
     }
 }
 #define MENU_X 237.f
 #define MENU_W 380.f
-#define MENU_H 56.f
-static float menu_y(int i) { return 110.f + i * (MENU_H + 12.f); }
+#define MENU_H 46.f
+static float menu_y(int i) { return 88.f + i * (MENU_H + 9.f); }
+#define HELPBTN_X 327.f
+#define HELPBTN_Y 408.f
+#define HELPBTN_W 200.f
+#define HELPBTN_H 46.f
 
 /* ---------------- pad pointer (touch or cursor+R) ---------------- */
 #define BTN_W 112.f
@@ -317,6 +370,10 @@ static float btn_x(int i) { return 12.f + i * (BTN_W + BTN_GAP); }
 
 static void pad_pointer(float x, float y) {
     G.lastTouchX = x; G.lastTouchY = y; G.touchFlash = .35f;
+    if (G.mode == MODE_HELP) {
+        if (x >= HELPBTN_X && x <= HELPBTN_X + HELPBTN_W && y >= HELPBTN_Y && y <= HELPBTN_Y + HELPBTN_H) { G.mode = G.helpFrom; sfx_play(S_UI, 1.f); }
+        return;
+    }
     if (G.mode != MODE_PLAY) {
         for (int i = 0; i < menu_count(); i++) if (x >= MENU_X && x <= MENU_X + MENU_W && y >= menu_y(i) && y <= menu_y(i) + MENU_H) { G.msel = i; menu_activate(i); return; }
         return;
@@ -347,7 +404,7 @@ static int edge(const Input *in, uint32_t b) { return (in->hold & b) && !(G.prev
 
 static Enemy *nearest_enemy(float x, float y, float range) {
     Enemy *best = NULL; float bd = range * range;
-    for (int i = 0; i < NE; i++) if (G.en[i].alive) {
+    for (int i = 0; i < NE; i++) if (G.en[i].alive && G.en[i].emerge <= 0) {
         float dx = G.en[i].x - x, dy = G.en[i].y - y, d = dx * dx + dy * dy; if (d < bd) { bd = d; best = &G.en[i]; }
     }
     return best;
@@ -375,27 +432,27 @@ static void update_buildings(float dt) {
                     if (e->stuck > 0 && dx * dx + dy * dy < 40 * 40) { e->hp -= 5 * dt; if (e->hp <= 0) kill_enemy(e); }
                 }
                 if (G.ct[r][c] <= 0) {
-                    G.ct[r][c] = frange(16, 24); float q = frand();
+                    G.ct[r][c] = frange(16, 24) * (rich_at(r, c) ? .5f : 1.f); float q = frand();
                     spawn_drop(q < .55f ? R_STONE : (q < .8f ? R_SHINY : R_STICK), cx, cy - 4, 14);
                     sfx_play(S_DIG, .8f); burst(0, cx, cy, 14, 140, RGB(130, 96, 62), 5, .6f); add_ft(0, cx, cy - 30, "Dug something up!", RGB(255, 235, 150), 18);
                 }
                 break;
-            case B_PICNIC: { float dx = p->x - cx, dy = p->y - cy; if (dx * dx + dy * dy < 70 * 70 && G.dead <= 0) heal += 7; } break;
+            case B_PICNIC: { float dx = p->x - cx, dy = p->y - cy; if (dx * dx + dy * dy < 70 * 70 && G.dead <= 0) heal += rich_at(r, c) ? 12 : 7; } break;
             case B_FIRE: {
                 float dx = p->x - cx, dy = p->y - cy; if (dx * dx + dy * dy < 120 * 120) p->fireBuff = .25f;
-                for (int i = 0; i < NE; i++) { Enemy *e = &G.en[i]; if (!e->alive) continue; float ex = e->x - cx, ey = e->y - cy; if (ex * ex + ey * ey < 78 * 78) { e->hp -= 8 * dt; e->burn = .1f; if (e->hp <= 0) kill_enemy(e); } }
+                for (int i = 0; i < NE; i++) { Enemy *e = &G.en[i]; if (!e->alive) continue; float ex = e->x - cx, ey = e->y - cy; if (ex * ex + ey * ey < 78 * 78) { e->hp -= (rich_at(r, c) ? 12 : 8) * dt; e->burn = .1f; if (e->hp <= 0) kill_enemy(e); } }
                 if (frand() < dt * 6) add_part(0, cx + frange(-8, 8), cy - 4, frange(-10, 10), -frange(40, 90), .7f, 3.5f, RGB(255, 190, 60), 0);
             } break;
             case B_TOWER:
                 if (G.ct[r][c] <= 0) {
                     Enemy *e = nearest_enemy(cx, cy - 20, 330);
-                    if (e) { G.ct[r][c] = .85f; spawn_shot(1, cx, cy - 30, e->x, e->y, 7, 640); sfx_play(S_SHOOT, .5f); }
+                    if (e) { G.ct[r][c] = .85f; spawn_shot(1, cx, cy - 30, e->x, e->y, rich_at(r, c) ? 11 : 7, 640); sfx_play(S_SHOOT, .5f); }
                     else G.ct[r][c] = .2f;
                 }
                 break;
             case B_GARDEN:
                 if (G.ct[r][c] <= 0) {
-                    G.ct[r][c] = 8.f; float q = frand();
+                    G.ct[r][c] = rich_at(r, c) ? 4.f : 8.f; float q = frand();
                     spawn_drop(q < .5f ? R_STICK : (q < .8f ? R_STONE : R_SHINY), cx + frange(-14, 14), cy + 6, 14);
                     sfx_play(S_TICK, 1.f); burst(0, cx, cy, 8, 80, RGB(130, 220, 120), 4, .5f);
                 }
@@ -411,6 +468,7 @@ static void update_buildings(float dt) {
 static void update_play(const Input *in, float dt) {
     Player *p = &G.p;
     int houses = count_b(B_HOUSE); G.maxhp = 100 + 25 * houses;
+    for (int r = 0; r < GROWS; r++) for (int c = 0; c < GCOLS; c++) if (G.sv.grid[r][c] == B_HOUSE && rich_at(r, c)) G.maxhp += 25;
     if (G.maxhp > (int)p->maxhp && p->hp > 0) p->hp += G.maxhp - p->maxhp;
     p->maxhp = G.maxhp; if (p->hp > p->maxhp) p->hp = p->maxhp;
 
@@ -425,6 +483,7 @@ static void update_play(const Input *in, float dt) {
         if (p->moving) { p->dx = mx / (mag > 0 ? mag : 1); p->dy = my / (mag > 0 ? mag : 1); if (fabsf(mx) > .2f) p->face = mx > 0 ? 1 : -1; }
         float spd = 250;
         if (p->dashT > 0) { p->dashT -= dt; mx = p->dx; my = p->dy; spd = 800; if (frand() < .8f) add_part(0, p->x, p->y + 6, frange(-20, 20), frange(-20, 20), .3f, 6, RGBA(255, 255, 255, 150), 0); }
+        G.tutDist += (fabsf(mx) + fabsf(my)) * spd * dt * .7f;
         p->x += mx * spd * dt; p->y += my * spd * dt;
         p->x = clampf(p->x, AX + 24, AX + AW - 24); p->y = clampf(p->y, AY + 30, AY + AH - 16);
         p->dashCd -= dt; p->cawCd -= dt; p->atkCd -= dt; p->iframes -= dt; p->flash -= dt;
@@ -434,7 +493,7 @@ static void update_play(const Input *in, float dt) {
         }
         if (edge(in, BTN_B) && p->cawCd <= 0) {
             p->cawCd = 6.f; G.cawFx = .55f; sfx_play(S_CAW, 1.f);
-            for (int i = 0; i < NE; i++) if (G.en[i].alive) {
+            for (int i = 0; i < NE; i++) if (G.en[i].alive && G.en[i].emerge <= 0) {
                 Enemy *e = &G.en[i]; float dx = e->x - p->x, dy = e->y - p->y, d = sqrtf(dx * dx + dy * dy) + 1e-3f;
                 if (d < 200) { damage_enemy(e, e->type == E_FOX ? 6 : 14, dx / d * 520, dy / d * 520); e->stuck = 0; }
             }
@@ -451,6 +510,7 @@ static void update_play(const Input *in, float dt) {
     /* waves */
     if (G.dead <= 0) {
         if (G.wstate == WS_BREAK) {
+            if (G.tut < 3) G.wtimer = 9.f;                     /* tutorial: the wave waits for you */
             G.wtimer -= dt;
             if (G.wtimer <= 0) start_wave();
         } else if (G.wstate == WS_FIGHT) {
@@ -460,20 +520,65 @@ static void update_play(const Input *in, float dt) {
                 if (w < 2) t = q < .7f ? E_RAT : E_SNAKE;
                 else if (w < 4) t = q < .4f ? E_RAT : (q < .65f ? E_SNAKE : E_CAT);
                 else t = q < .3f ? E_RAT : (q < .55f ? E_SNAKE : E_CAT);
-                spawn_enemy(t); G.toSpawn--;
+                queue_spawn(t, 2.0f); G.toSpawn--;
                 G.spawnT = fmaxf(.32f, 1.25f - .05f * w) * frange(.7f, 1.3f);
-                if (G.bossLeft && G.toSpawn < (8 + 4 * w) / 2) { spawn_enemy(E_FOX); G.bossLeft = 0; add_ft(0, AX + AW / 2, AY + 60, "THE FOX IS COMING!", RGB(255, 160, 80), 40); }
+                if (G.bossLeft && G.toSpawn < (8 + 4 * w) / 2) { queue_spawn(E_FOX, 3.0f); G.bossLeft = 0; add_ft(0, AX + AW / 2, AY + 60, "THE FOX IS COMING!", RGB(255, 160, 80), 40); }
             }
             if (G.toSpawn <= 0 && !G.bossLeft) G.wstate = WS_CLEAR;
         } else {
-            int alive = 0; for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
+            int alive = warns_left(); for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
             if (alive == 0) wave_cleared();
+        }
+    }
+
+    /* burrow warnings */
+    for (int i = 0; i < NW; i++) if (G.wn[i].alive) {
+        Warn *w = &G.wn[i]; w->t -= dt;
+        if (w->t < .9f && frand() < dt * 28) add_part(0, w->x + frange(-16, 16), w->y + 4, frange(-30, 30), -frange(30, 90), .5f, 4, RGB(150, 112, 74), 0);
+        if (w->t <= 0) { w->alive = 0; spawn_enemy_at(w->type, w->x, w->y); burst(0, w->x, w->y, 12, 150, RGB(140, 104, 68), 5, .5f); sfx_play(S_TRAP, .5f); }
+    }
+    /* buried treasure: the GamePad shows where it is, Kruczek digs it up on the TV */
+    for (int i = 0; i < NTR; i++) if (G.tr[i].alive) {
+        Treasure *tr = &G.tr[i]; float dx = p->x - tr->x, dy = p->y - tr->y;
+        if (dx * dx + dy * dy < 44.f * 44.f && G.dead <= 0) {
+            tr->prog += dt / 1.3f;
+            if (frand() < dt * 20) add_part(0, tr->x + frange(-14, 14), tr->y + 6, frange(-50, 50), -frange(40, 110), .5f, 4, RGB(150, 112, 74), 0);
+            if (G.holeSnd <= 0) { sfx_play(S_DIG, .5f); G.holeSnd = .35f; }
+            if (tr->prog >= 1.f) {
+                tr->alive = 0; G.tutDug = 1; sfx_play(S_UNLOCK, .8f);
+                int n = 4 + rand() % 3;
+                for (int k = 0; k < n; k++) spawn_drop(k % 3, tr->x + frange(-30, 30), tr->y + frange(-24, 24), 16);
+                spawn_drop(3, tr->x, tr->y + 20, 14);
+                burst(0, tr->x, tr->y, 24, 220, RGB(255, 214, 90), 5, .7f); add_ft(0, tr->x, tr->y - 36, "Treasure!", RGB(255, 226, 110), 32);
+                add_ft(1, padx(tr->x), pady(tr->y) - 14, "found!", RGB(255, 226, 110), 18);
+            }
+        } else tr->prog = fmaxf(0.f, tr->prog - dt * .5f);
+    }
+
+    /* tutorial */
+    if (G.tut < 6) {
+        G.tutT += dt;
+        int adv = 0;
+        switch (G.tut) {
+            case 0: adv = G.tutDist > 260; break;
+            case 1: adv = G.tutBuilt; break;
+            case 2: adv = G.tutDug; break;
+            case 3: adv = G.tutKills >= 4; break;
+            case 4: adv = G.tutCaught; break;
+            case 5: if (G.tutT > 6.f) { G.sv.tutDone = 1; G.tut = 6; game_save(); } break;
+        }
+        if (adv) {
+            G.tut++; G.tutT = 0; sfx_play(S_UNLOCK, .6f);
+            if (G.tut == 2) spawn_treasures(1);
+            if (G.tut == 3) { G.wtimer = 1.5f; }
+            if (G.tut == 5) { spawn_treasures(2); }
         }
     }
 
     /* enemies */
     for (int i = 0; i < NE; i++) {
         Enemy *e = &G.en[i]; if (!e->alive) continue;
+        if (e->emerge > 0) { e->emerge -= dt; continue; }        /* still climbing out of the burrow: harmless */
         e->t += dt; e->flash -= dt; e->holeImm -= dt; e->burn -= dt;
         float dx = p->x - e->x, dy = p->y - e->y, d = sqrtf(dx * dx + dy * dy) + 1e-3f;
         float ux = dx / d, uy = dy / d;
@@ -510,6 +615,7 @@ static void update_play(const Input *in, float dt) {
             float ox = o->x - e->x, oy = o->y - e->y, od = sqrtf(ox * ox + oy * oy) + 1e-3f, mind = (e->r + o->r) * .8f;
             if (od < mind) { float push = (mind - od) * .5f; e->x -= ox / od * push; e->y -= oy / od * push; o->x += ox / od * push; o->y += oy / od * push; }
         }
+        e->x = clampf(e->x, AX + e->r * .8f, AX + AW - e->r * .8f); e->y = clampf(e->y, AY + e->r * .8f, AY + AH - e->r * .6f);
         /* contact */
         if (G.dead <= 0 && d < e->r + 13) {
             hurt_player(dmg); e->vx -= ux * 260; e->vy -= uy * 260; if (e->type != E_FOX) e->stuck = 0;
@@ -521,7 +627,7 @@ static void update_play(const Input *in, float dt) {
         Shot *s = &G.sh[i]; if (!s->alive) continue;
         s->x += s->vx * dt; s->y += s->vy * dt; s->life -= dt; if (s->life <= 0) { s->alive = 0; continue; }
         for (int j = 0; j < NE; j++) {
-            Enemy *e = &G.en[j]; if (!e->alive) continue;
+            Enemy *e = &G.en[j]; if (!e->alive || e->emerge > 0) continue;
             float dx = e->x - s->x, dy = e->y - s->y;
             if (dx * dx + dy * dy < (e->r + 7) * (e->r + 7)) {
                 float sp = sqrtf(s->vx * s->vx + s->vy * s->vy) + 1e-3f;
@@ -582,6 +688,12 @@ static void update_common(const Input *in, float dt) {
 }
 
 void game_update(const Input *in, float dt) {
+    /* adaptive quality: if frames take > 45 ms for ~1.5 s, drop ink outlines; restore when comfortably fast */
+    { static float avg = .016f, slowT = 0, fastT = 0;
+      avg += (dt - avg) * .1f;
+      if (avg > .045f) { slowT += dt; fastT = 0; } else if (avg < .028f) { fastT += dt; slowT = 0; } else { slowT = fastT = 0; }
+      if (slowT > 1.5f && !gfx_lowq()) { gfx_set_lowq(1); slowT = 0; }
+      if (fastT > 6.f && gfx_lowq()) { gfx_set_lowq(0); fastT = 0; } }
     if (dt > .05f) dt = .05f;
     /* pad cursor (right stick) + press */
     float rx = in->rx, ry = in->ry;
@@ -597,6 +709,8 @@ void game_update(const Input *in, float dt) {
         if (edge(in, BTN_PLUS)) { G.mode = MODE_PAUSE; G.msel = 0; sfx_play(S_UI, 1.f); }
         else update_play(in, dt);
         G.saveT += dt; if (G.saveT > 30) { G.saveT = 0; game_save(); }
+    } else if (G.mode == MODE_HELP) {
+        if (edge(in, BTN_A) || edge(in, BTN_B) || edge(in, BTN_PLUS)) { G.mode = G.helpFrom; sfx_play(S_UI, 1.f); }
     } else {
         int n = menu_count();
         if (edge(in, BTN_UP)) { G.msel = (G.msel + n - 1) % n; sfx_play(S_TICK, 1.f); }
@@ -615,7 +729,7 @@ int game_quit(void) { return G.quit; }
 /* =====================================================================
  *                              RENDERING
  * ===================================================================== */
-static Fb bg_tv, bg_pad;
+static Fb bg_tv, bg_pad, bg_padm;
 #define WHITE RGB(255, 255, 255)
 #define INK RGB(34, 22, 28)
 #define CREAM RGB(246, 230, 196)
@@ -625,7 +739,7 @@ static Fb bg_tv, bg_pad;
 static void ink(float s) { gfx_set_outline(fmaxf(1.15f, 2.2f * s), INK); }
 static void ink_off(void) { gfx_set_outline(0, 0); }
 static uint32_t fl(uint32_t c, float k) { return k > 0 ? gfx_mix(c, WHITE, k > 1 ? 1 : k) : c; }
-static void shadow(Fb *f, float x, float y, float rx, float ry) { fb_ellipse(f, x, y, rx, ry, 0, RGBA(0, 0, 0, 60)); }
+static void shadow(Fb *f, float x, float y, float rx, float ry) { if (gfx_lowq()) return; fb_ellipse(f, x, y, rx, ry, 0, RGBA(0, 0, 0, 60)); }
 
 static void draw_heart(Fb *f, float x, float y, float s, uint32_t c) {
     ink(s * .8f);
@@ -808,15 +922,60 @@ static void grain(Fb *f, int amount) {
     }
 }
 static void vignette(Fb *f, float strength) {
-    float cx = f->w / 2.f, cy = f->h / 2.f, md = sqrtf(cx * cx + cy * cy);
+    float cx = f->w / 2.f, cy = f->h / 2.f, md = fsq(cx * cx + cy * cy);
     for (int y = 0; y < f->h; y++) for (int x = 0; x < f->w; x++) {
-        float d = sqrtf((x - cx) * (x - cx) + (y - cy) * (y - cy)) / md; float k = 1.f - strength * d * d;
+        float d = fsq((x - cx) * (x - cx) + (y - cy) * (y - cy)) / md; float k = 1.f - strength * d * d;
         uint32_t c = f->px[y * f->w + x];
         f->px[y * f->w + x] = ((uint32_t)((c >> 24) * k) << 24) | ((uint32_t)(((c >> 16) & 255) * k) << 16) | ((uint32_t)(((c >> 8) & 255) * k) << 8) | 0xFFu;
     }
 }
 static void leaf(Fb *f, float x, float y, float s, float a, uint32_t c) {
     fb_ellipse(f, x, y, 7 * s, 4 * s, a, c); fb_line(f, x - cosf(a) * 7 * s, y - sinf(a) * 7 * s, x + cosf(a) * 6 * s, y + sinf(a) * 6 * s, .9f * s, gfx_mix(c, INK, .45f));
+}
+
+static uint32_t etype_col(int t) { return t == E_CAT ? RGB(240, 150, 70) : t == E_SNAKE ? RGB(110, 200, 90) : t == E_FOX ? RGB(230, 90, 40) : RGB(176, 176, 190); }
+static void blit(Fb *dst, const Fb *src, int x, int y) {
+    for (int yy = 0; yy < src->h; yy++) {
+        int dy = y + yy; if (dy < 0 || dy >= dst->h) continue;
+        int x0 = x < 0 ? -x : 0, x1 = x + src->w > dst->w ? dst->w - x : src->w;
+        if (x1 > x0) memcpy(&dst->px[dy * dst->w + x + x0], &src->px[yy * src->w + x0], (size_t)(x1 - x0) * 4);
+    }
+}
+static void chip_frame(Fb *f, float x, float y, int size) {
+    fb_rrect(f, x - 2, y - size * .75f - 2, size * 3.6f + 4, size * 1.5f + 4, size * .75f + 2, INK);
+    fb_rrect(f, x, y - size * .75f, size * 3.6f, size * 1.5f, size * .75f, PANEL_D);
+}
+static void chip_dyn(Fb *f, int k, int n, float x, float y, int size, float t) {
+    draw_res(f, k, x + size * .8f, y, size / 24.f * 1.0f, t);
+    char b[16]; snprintf(b, sizeof b, "%d", n); gfx_font(FONT_DISPLAY); fb_text_shadow(f, b, x + size * 1.55f, y, (int)(size * 1.05f), CREAM, 0); gfx_font(FONT_UI);
+}
+/* Pre-rendered build-bar buttons (normal / selected / locked) - drawing 6 outlined buildings per frame was too slow */
+static Fb btn_img[3][B_N];
+#define BIW ((int)BTN_W + 8)
+#define BIH ((int)BAR_H + 8)
+static void build_btn_imgs(void) {
+    for (int v = 0; v < 3; v++) for (int i = 0; i < B_N; i++) {
+        Fb *f = &btn_img[v][i]; f->w = BIW; f->h = BIH; f->px = (uint32_t *)malloc(sizeof(uint32_t) * BIW * BIH);
+        fb_clear(f, RGB(84, 58, 44));
+        float x = 4, y = 4; int sel = v == 1, lock = v == 2;
+        fb_rrect(f, x - 2.5f, y - 2.5f, BTN_W + 5, BAR_H + 5, 14, sel ? ACCENT : INK);
+        fb_rrect(f, x, y, BTN_W, BAR_H, 12, lock ? RGB(48, 36, 36) : (sel ? RGB(98, 70, 54) : PANEL));
+        gfx_set_alpha(lock ? .35f : 1.f); draw_building(f, i, x + 24, y + 30, 0.4f, 0.f); gfx_set_alpha(1.f);
+        fb_text(f, lock ? "???" : BNAME[i], x + 46, y + 15, 15, lock ? RGB(140, 120, 112) : CREAM, 0);
+        if (lock) {
+            char b[24]; snprintf(b, sizeof b, "wave %d", BREQ[i]); fb_text(f, b, x + BTN_W / 2, y + 48, 15, RGB(176, 154, 140), 1);
+            fb_rrect(f, x + 17, y + 24, 14, 11, 3, RGB(210, 210, 214)); fb_ring(f, x + 24, y + 22, 5, 2, RGB(210, 210, 214));
+        } else {
+            float cx = x + 14;
+            for (int k = 0; k < R_N; k++) if (BCOST[i][k] > 0) { draw_res(f, k, cx, y + 49, .5f, 0.f); cx += 34; }
+        }
+    }
+}
+/* soft burrow marks, drawn on the GamePad background only */
+static void draw_burrow_mark(Fb *f, float x, float y) {
+    fb_ellipse(f, x, y + 2, 15, 8, 0, RGBA(40, 26, 20, 150));
+    fb_ellipse(f, x, y + 3, 11, 5.5f, 0, RGBA(14, 8, 6, 200));
+    for (int i = 0; i < 5; i++) { float a = i * 1.3f + .3f; fb_circle(f, x + cosf(a) * 14, y + 3 + sinf(a) * 7, 2.2f, RGBA(120, 88, 58, 200)); }
 }
 static void build_bgs(void) {
     bg_tv.w = TVW; bg_tv.h = TVH; bg_tv.px = (uint32_t *)malloc(sizeof(uint32_t) * TVW * TVH);
@@ -856,6 +1015,7 @@ static void build_bgs(void) {
     Fb *g = &bg_pad;
     fb_vgrad(g, 0, 0, PADW, PADH, RGB(66, 48, 42), RGB(40, 28, 30));
     for (int i = 0; i < 18; i++) fb_line(g, 0, 20 + i * 27 + frange(-3, 3), PADW, 20 + i * 27 + frange(-3, 3), 1.2f, RGBA(0, 0, 0, 40));
+    bg_padm.w = PADW; bg_padm.h = PADH; bg_padm.px = (uint32_t *)malloc(sizeof(uint32_t) * PADW * PADH); fb_copy(&bg_padm, g);
     fb_rrect(g, MX - 9, MY - 9, 838, 360, 14, INK);
     fb_rrect(g, MX - 6, MY - 6, 832, 354, 12, RGB(112, 74, 48));
     fb_rrect(g, MX - 2.5f, MY - 2.5f, 825, 347, 9, INK);
@@ -865,19 +1025,28 @@ static void build_bgs(void) {
     for (int i = 0; i < 26; i++) { float x = frange(MX + 10, MX + 810), y = frange(MY + 10, MY + 332); leaf(g, x, y, .6f, frange(0, 6.28f), (i % 3 == 0) ? RGB(214, 112, 44) : ((i % 3 == 1) ? RGB(226, 178, 62) : RGB(184, 62, 44))); }
     fb_rrect(g, 5, BAR_Y - 7, PADW - 10, BAR_H + 14, 14, INK);
     fb_rrect(g, 8, BAR_Y - 4, PADW - 16, BAR_H + 8, 12, RGB(84, 58, 44));
+    for (int i = 0; i < NBURROW; i++) draw_burrow_mark(g, padx(BURROW[i][0]), pady(BURROW[i][1]));
     grain(g, 5);
+    /* static parts of the GamePad top bar */
+    fb_rrect(g, 3, 1, PADW - 6, 50, 17, INK); fb_rrect(g, 6, 4, PADW - 12, 44, 14, PANEL);
+    for (int k = 0; k < R_N; k++) chip_frame(g, 18 + k * 118, 26, 20);
+    /* static parts of the TV HUD */
+    fb_rrect(f, 25, 11, 1230, 106, 22, INK); fb_rrect(f, 28, 14, 1224, 100, 19, PANEL); fb_rrect(f, 28, 14, 1224, 6, 3, RGB(86, 62, 52));
+    draw_heart(f, 66, 48, 1.3f, RGB(240, 80, 110));
+    fb_rrect(f, 89, 33, 336, 32, 16, INK); fb_rrect(f, 92, 36, 330, 26, 13, PANEL_D);
+    fb_text_shadow(f, "A  Dash", 66, 88, 18, CREAM, 0); fb_rrect(f, 148, 80, 74, 16, 8, INK); fb_rrect(f, 150, 82, 70, 12, 6, PANEL_D);
+    fb_text_shadow(f, "B  Caw", 240, 88, 18, CREAM, 0); fb_rrect(f, 348, 80, 76, 16, 8, INK); fb_rrect(f, 350, 82, 72, 12, 6, PANEL_D);
+    /* TV-only legend (right side of the HUD) */
+    fb_ellipse(f, 905, 48, 22, 13, 0, RGBA(255, 214, 90, 90)); fb_ring(f, 905, 48, 20, 2.5f, RGBA(255, 226, 120, 220));
+    fb_text_shadow(f, "Gold glow = rich soil", 940, 40, 22, RGB(255, 226, 140), 0);
+    fb_text_shadow(f, "Only the TV can see it", 940, 70, 18, RGB(214, 196, 168), 0);
+    build_btn_imgs();
     srand(1234u);
 }
 
 /* ------------- TV screen ------------- */
 static void txt_a(Fb *f, const char *s, float x, float y, int size, uint32_t c, int al, float a) { gfx_set_alpha(a); gfx_font(FONT_DISPLAY); fb_text_shadow(f, s, x, y, size, c, al); gfx_font(FONT_UI); gfx_set_alpha(1.f); }
 
-static void draw_res_chip(Fb *f, int k, int n, float x, float y, int size, float t) {
-    fb_rrect(f, x - 2, y - size * .75f - 2, size * 3.6f + 4, size * 1.5f + 4, size * .75f + 2, INK);
-    fb_rrect(f, x, y - size * .75f, size * 3.6f, size * 1.5f, size * .75f, PANEL_D);
-    draw_res(f, k, x + size * .8f, y, size / 24.f * 1.0f, t);
-    char b[16]; snprintf(b, sizeof b, "%d", n); gfx_font(FONT_DISPLAY); fb_text_shadow(f, b, x + size * 1.55f, y, (int)(size * 1.05f), CREAM, 0); gfx_font(FONT_UI);
-}
 
 static void render_title_tv(Fb *f) {
     float t = G.tvTime;
@@ -894,11 +1063,62 @@ static void render_title_tv(Fb *f) {
     txt_a(f, "Pick up the GamePad and touch the screen", 640, 660, 24, RGB(190, 210, 240), 1, .7f + .3f * sinf(t * 3));
 }
 
+
+static void render_help_tv(Fb *f) {
+    fb_copy(f, &bg_tv);
+    gfx_set_alpha(.9f); fb_rect(f, 0, 0, TVW, TVH, RGB(14, 10, 14)); gfx_set_alpha(.88f); fb_rrect(f, 110, 60, 1060, 600, 34, INK); fb_rrect(f, 114, 64, 1052, 592, 31, PANEL); gfx_set_alpha(1);
+    txt_a(f, "HOW TO PLAY", 640, 112, 58, CREAM, 1, 1.f);
+    static const char *L[] = {
+        "1   Fight on the TV. Kruczek shoots on his own.",
+        "      Left stick = move     A = dash     B = caw (pushes enemies away)",
+        "2   Enemies drop loot. Walk over it and it falls onto the GamePad.",
+        "3   TAP the falling loot on the GamePad before it breaks.",
+        "4   Spend loot on the GamePad map to build. Clear waves to unlock more.",
+    };
+    for (int i = 0; i < 5; i++) fb_text_shadow(f, L[i], 170, 190 + i * 42, i == 1 ? 22 : 25, i == 1 ? RGB(214, 196, 168) : CREAM, 0);
+    fb_rrect(f, 170, 418, 940, 3, 1.5f, RGB(120, 90, 70));
+    txt_a(f, "Each screen knows something the other cannot see - talk to each other!", 640, 456, 26, ACCENT, 1, 1.f);
+    fb_text_shadow(f, "GamePad only:  enemy burrows (flash before enemies appear) and buried treasure (gold X).", 170, 510, 23, RGB(190, 220, 255), 0);
+    fb_text_shadow(f, "TV only:  rich soil (gold glow, build there for bonuses) and enemy health bars.", 170, 552, 23, RGB(255, 226, 140), 0);
+    fb_text_shadow(f, "Use the GamePad to go back", 640, 620, 20, RGBA(240, 222, 190, 200), 1);
+}
+static void draw_help_pad(Fb *f) {
+    float t = G.padTime;
+    txt_a(f, "HOW TO PLAY", PADW / 2, 40, 36, CREAM, 1, 1.f);
+    static const char *L[] = { "Loot falls onto this screen - TAP it fast!", "Tap the map to build. Tap a button to pick what.",
+        "Gold X (buried loot) and flashing burrows", "are visible ONLY on this screen.", "Rich soil (gold glow) and enemy health", "are visible ONLY on the TV.", "Tell each other what you see!" };
+    for (int i = 0; i < 7; i++) fb_text_shadow(f, L[i], PADW / 2, 100 + i * 36 + (i >= 2 ? 10 : 0) + (i >= 4 ? 10 : 0) + (i == 6 ? 12 : 0), i == 6 ? 22 : 21, i == 6 ? ACCENT : CREAM, 1);
+    float pulse = 1.f + .02f * sinf(t * 6);
+    float w = HELPBTN_W * pulse, h = HELPBTN_H * pulse, x = HELPBTN_X + (HELPBTN_W - w) / 2, y = HELPBTN_Y + (HELPBTN_H - h) / 2;
+    fb_rrect(f, x - 3, y - 3, w + 6, h + 6, 22, ACCENT); fb_rrect(f, x, y, w, h, 19, RGB(104, 74, 56));
+    gfx_font(FONT_DISPLAY); fb_text_shadow(f, "Back", PADW / 2, HELPBTN_Y + HELPBTN_H / 2, 26, CREAM, 1); gfx_font(FONT_UI);
+    if (G.touchFlash > 0) { float k = 1 - G.touchFlash / .35f; gfx_set_alpha(1 - k); fb_ring(f, G.lastTouchX, G.lastTouchY, 8 + k * 26, 3, WHITE); gfx_set_alpha(1); }
+}
+
 static void render_tv(Fb *f) {
     if (G.mode == MODE_TITLE) { render_title_tv(f); return; }
+    if (G.mode == MODE_HELP) { render_help_tv(f); return; }
     Player *p = &G.p; float t = G.tvTime;
     fb_copy(f, &bg_tv);
 
+    /* rich soil: glows gold on the TV only */
+    for (int r = 0; r < GROWS; r++) for (int c = 0; c < GCOLS; c++) if (G.sv.soil[r][c]) {
+        float cx = cellcx(c), cy = cellcy(r), pu = .5f + .5f * sinf(t * 2.2f + c + r);
+        int has = G.sv.grid[r][c] >= 0;
+        fb_ellipse(f, cx, cy + 6, 44, 27, 0, RGBA(255, 214, 90, has ? 26 : (int)(46 + 26 * pu)));
+        fb_ring(f, cx, cy + 6, has ? 40.f : 30.f, 2.2f, RGBA(255, 232, 130, has ? 120 : (int)(110 + 80 * pu)));
+        if (!has) for (int k = 0; k < 3; k++) { float a = t * 1.1f + k * 2.1f + r; fb_circle(f, cx + cosf(a) * 20, cy + 4 + sinf(a) * 10, 1.8f + pu, RGBA(255, 244, 190, 200)); }
+    }
+    /* burrow dust (the warning itself is on the GamePad) and treasure digging */
+    for (int i = 0; i < NW; i++) if (G.wn[i].alive && G.wn[i].t < .9f) {
+        Warn *w = &G.wn[i]; float k = 1 - w->t / .9f;
+        fb_ellipse(f, w->x, w->y + 6, 18 + 12 * k, 8 + 5 * k, 0, RGBA(110, 84, 56, 190));
+    }
+    for (int i = 0; i < NTR; i++) if (G.tr[i].alive && G.tr[i].prog > 0.f) {
+        Treasure *tr = &G.tr[i];
+        fb_ellipse(f, tr->x, tr->y + 8, 26, 12, 0, RGBA(96, 70, 46, 220));
+        fb_circle(f, tr->x, tr->y, 4 + tr->prog * 22, RGBA(255, 214, 90, 110)); fb_ring(f, tr->x, tr->y, 30, 4, RGBA(255, 255, 255, 190));
+    }
     /* buildings */
     for (int r = 0; r < GROWS; r++) for (int c = 0; c < GCOLS; c++) {
         int b = G.sv.grid[r][c]; if (b < 0) continue;
@@ -928,7 +1148,8 @@ static void render_tv(Fb *f) {
                 fb_text_shadow(f, "!", e->x, e->y - 78, 44, RGB(255, 220, 80), 1);
             }
             if (e->stuck > 0) fb_ring(f, e->x, e->y, e->r + 6, 3, RGBA(200, 255, 150, 180));
-            draw_enemy(f, e);
+            if (e->emerge > 0) gfx_set_alpha(.3f + .7f * (1 - e->emerge / .6f));
+            draw_enemy(f, e); gfx_set_alpha(1.f);
         } else if (G.dead <= 0) {
             int blink = p->iframes > 0 && ((int)(t * 20) % 2 == 0);
             if (blink) gfx_set_alpha(.45f);
@@ -952,32 +1173,38 @@ static void render_tv(Fb *f) {
     /* hurt vignette */
     if (G.hurtFlash > 0) { float a = G.hurtFlash / .35f * .3f; gfx_set_alpha(a); fb_rect(f, 0, 0, TVW, 14, RGB(255, 40, 40)); fb_rect(f, 0, TVH - 14, TVW, 14, RGB(255, 40, 40)); fb_rect(f, 0, 0, 14, TVH, RGB(255, 40, 40)); fb_rect(f, TVW - 14, 0, 14, TVH, RGB(255, 40, 40)); gfx_set_alpha(1); }
 
-    /* HUD */
-    fb_rrect(f, 25, 11, 1230, 106, 22, INK); fb_rrect(f, 28, 14, 1224, 100, 19, PANEL); fb_rrect(f, 28, 14, 1224, 6, 3, RGB(86, 62, 52));
-    draw_heart(f, 66, 48, 1.3f, RGB(240, 80, 110));
-    fb_rrect(f, 89, 33, 336, 32, 16, INK); fb_rrect(f, 92, 36, 330, 26, 13, PANEL_D);
+    /* HUD (static frame is baked into the background) */
     float hk = clampf(p->hp / p->maxhp, 0, 1);
     if (hk > 0) fb_rrect(f, 92, 36, fmaxf(26, 330 * hk), 26, 13, hk > .5f ? RGB(150, 190, 78) : (hk > .25f ? RGB(236, 176, 60) : RGB(206, 70, 58)));
-    char b[64]; snprintf(b, sizeof b, "%d / %d", (int)ceilf(p->hp), (int)p->maxhp); fb_text_shadow(f, b, 257, 49, 19, CREAM, 1);
-    /* cooldown pips */
+    char b[96]; snprintf(b, sizeof b, "%d / %d", (int)ceilf(p->hp), (int)p->maxhp); fb_text_shadow(f, b, 257, 49, 19, CREAM, 1);
     float dk = 1 - clampf(p->dashCd / 1.2f, 0, 1), ck = 1 - clampf(p->cawCd / 6.f, 0, 1);
-    fb_text_shadow(f, "A  Dash", 66, 88, 18, dk >= 1 ? CREAM : RGB(170, 150, 140), 0); fb_rrect(f, 148, 80, 74, 16, 8, INK); fb_rrect(f, 150, 82, 70, 12, 6, PANEL_D); fb_rrect(f, 150, 82, fmaxf(12, 70 * dk), 12, 6, dk >= 1 ? RGB(120, 196, 200) : RGB(90, 110, 112));
-    fb_text_shadow(f, "B  Caw", 240, 88, 18, ck >= 1 ? CREAM : RGB(170, 150, 140), 0); fb_rrect(f, 348, 80, 76, 16, 8, INK); fb_rrect(f, 350, 82, 72, 12, 6, PANEL_D); fb_rrect(f, 350, 82, fmaxf(12, 72 * ck), 12, 6, ck >= 1 ? RGB(236, 176, 60) : RGB(130, 108, 78));
+    fb_rrect(f, 150, 82, fmaxf(12, 70 * dk), 12, 6, dk >= 1 ? RGB(120, 196, 200) : RGB(90, 110, 112));
+    fb_rrect(f, 350, 82, fmaxf(12, 72 * ck), 12, 6, ck >= 1 ? RGB(236, 176, 60) : RGB(130, 108, 78));
     snprintf(b, sizeof b, "WAVE %d", G.sv.wave); gfx_font(FONT_DISPLAY); fb_text_shadow(f, b, 640, 44, 46, CREAM, 1); gfx_font(FONT_UI);
-    int alive = 0; for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
+    int alive = warns_left(); for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
     if (G.dead > 0) snprintf(b, sizeof b, "Respawning...");
-    else if (G.wstate == WS_BREAK) snprintf(b, sizeof b, "Break - next wave in %d s", (int)ceilf(G.wtimer));
-    else snprintf(b, sizeof b, "Enemies: %d", alive + G.toSpawn + G.bossLeft);
-    fb_text_shadow(f, b, 650, 88, 21, RGB(226, 208, 176), 1);
-    for (int k = 0; k < R_N; k++) draw_res_chip(f, k, G.sv.res[k], 820 + k * 142, 62, 26, t);
-    fb_text_shadow(f, "Left stick: move   ·   Build and catch loot on the GamePad", 640, 690, 21, RGBA(240, 222, 190, 200), 1);
+    else if (G.wstate == WS_BREAK) snprintf(b, sizeof b, "Break - next wave in %d s", G.tut < 3 ? 0 : (int)ceilf(G.wtimer));
+    else snprintf(b, sizeof b, "Enemies left: %d", alive + G.toSpawn + G.bossLeft);
+    if (!(G.wstate == WS_BREAK && G.tut < 3)) fb_text_shadow(f, b, 650, 88, 21, RGB(226, 208, 176), 1);
+    else fb_text_shadow(f, "Break - the wave starts when you are ready", 650, 88, 21, RGB(226, 208, 176), 1);
+    if (G.tut < 6) {
+        static const char *tvt[6] = { "Move Kruczek with the LEFT STICK", "Now look at the GamePad: tap its map to build a Hole",
+            "Gold X on the GamePad = buried loot. Walk Kruczek there!", "Defeat the enemies! A = dash, B = caw. Kruczek shoots alone",
+            "Walk over loot, then TAP it on the GamePad before it breaks", "Well done! Survive the waves and unlock new buildings" };
+        float pu = .5f + .5f * sinf(t * 5);
+        fb_rrect(f, 212, 662, 856, 54, 24, pu > .5f ? ACCENT : INK); fb_rrect(f, 215, 665, 850, 48, 21, PANEL);
+        snprintf(b, sizeof b, "TUTORIAL %d/6", G.tut + 1); fb_text_shadow(f, b, 236, 689, 15, ACCENT, 0);
+        fb_text_shadow(f, tvt[G.tut], 700, 689, 23, CREAM, 1);
+    } else if (G.dead <= 0) {
+        fb_text_shadow(f, G.wstate == WS_BREAK ? "Break: build on the GamePad, and dig up its gold X marks with Kruczek" : "Tap the loot that falls onto the GamePad before it breaks", 640, 692, 21, RGBA(240, 222, 190, 215), 1);
+    }
 
     /* banners */
     if (G.bannerT > 0 && G.dead <= 0) {
         float k = clampf(G.bannerT / 2.6f, 0, 1), a = k > .85f ? (1 - k) / .15f : (k < .2f ? k / .2f : 1.f);
         float sc = G.bannerT > 2.3f ? 1.f + (G.bannerT - 2.3f) * 1.5f : 1.f;
         gfx_set_alpha(a * .85f); fb_rrect(f, 640 - 423 * sc, 233, 846 * sc, 106, 33, INK); fb_rrect(f, 640 - 420 * sc, 236, 840 * sc, 100, 30, G.bannerBoss ? RGB(150, 48, 38) : PANEL); gfx_set_alpha(1);
-        txt_a(f, G.banner, 640, 286, (int)(46 * sc), G.bannerBoss ? RGB(255, 206, 130) : CREAM, 1, a);
+        txt_a(f, G.banner, 640, 286, 46, G.bannerBoss ? RGB(255, 206, 130) : CREAM, 1, a);
     }
     if (G.unlockT > 0) {
         float a = clampf(G.unlockT / .5f, 0, 1);
@@ -1001,9 +1228,9 @@ static void draw_menu_pad(Fb *f) {
         char lab[48]; menu_label(i, lab, sizeof lab);
         float y = menu_y(i), pulse = (i == G.msel) ? 1.f + .02f * sinf(t * 6) : 1.f;
         float w = MENU_W * pulse, h = MENU_H * pulse, x = MENU_X + (MENU_W - w) / 2, yy = y + (MENU_H - h) / 2;
-        fb_rrect(f, x - 3, yy - 3, w + 6, h + 6, 22, i == G.msel ? ACCENT : INK);
-        fb_rrect(f, x, yy, w, h, 19, i == G.msel ? RGB(104, 74, 56) : PANEL);
-        gfx_font(FONT_DISPLAY); fb_text_shadow(f, lab, PADW / 2, y + MENU_H / 2, 27, CREAM, 1); gfx_font(FONT_UI);
+        fb_rrect(f, x - 3, yy - 3, w + 6, h + 6, 20, i == G.msel ? ACCENT : INK);
+        fb_rrect(f, x, yy, w, h, 17, i == G.msel ? RGB(104, 74, 56) : PANEL);
+        gfx_font(FONT_DISPLAY); fb_text_shadow(f, lab, PADW / 2, y + MENU_H / 2, 25, CREAM, 1); gfx_font(FONT_UI);
     }
     fb_text(f, "Tap a button   ·   or D-pad + A", PADW / 2, 452, 17, RGBA(240, 222, 190, 190), 1);
     if (G.touchFlash > 0) { float k = 1 - G.touchFlash / .35f; gfx_set_alpha(1 - k); fb_ring(f, G.lastTouchX, G.lastTouchY, 8 + k * 26, 3, WHITE); gfx_set_alpha(1); }
@@ -1011,7 +1238,8 @@ static void draw_menu_pad(Fb *f) {
 
 static void render_pad(Fb *f) {
     float t = G.padTime;
-    fb_copy(f, &bg_pad);
+    fb_copy(f, G.mode == MODE_PLAY ? &bg_pad : &bg_padm);
+    if (G.mode == MODE_HELP) { draw_help_pad(f); return; }
     if (G.mode != MODE_PLAY) { draw_menu_pad(f); return; }
 
     /* map: buildings */
@@ -1042,13 +1270,38 @@ static void render_pad(Fb *f) {
     if (G.cawFx > 0) { float k = 1 - G.cawFx / .55f; gfx_set_alpha(1 - k); fb_ring(f, padx(G.p.x), pady(G.p.y), (20 + k * 190) * MS, 3, WHITE); gfx_set_alpha(1); }
     for (int i = 0; i < NS; i++) if (G.sh[i].alive) fb_circle(f, padx(G.sh[i].x), pady(G.sh[i].y), 2, WITH_A(WHITE, 180));
 
-    /* top bar */
-    fb_rrect(f, 3, 1, PADW - 6, 50, 17, INK); fb_rrect(f, 6, 4, PADW - 12, 44, 14, PANEL);
-    for (int k = 0; k < R_N; k++) draw_res_chip(f, k, G.sv.res[k], 18 + k * 118, 26, 20, t);
+    /* top bar (frame is baked) */
+    for (int k = 0; k < R_N; k++) chip_dyn(f, k, G.sv.res[k], 18 + k * 118, 26, 20, t);
     if (G.combo >= 2) { char b[24]; snprintf(b, sizeof b, "COMBO x%d", G.combo); gfx_font(FONT_DISPLAY); fb_text_shadow(f, b, 388, 26, 21, ACCENT, 0); gfx_font(FONT_UI); }
-    { char b[64]; int alive = 0; for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
-      if (G.wstate == WS_BREAK) snprintf(b, sizeof b, "Wave %d  ·  starts in %d s", G.sv.wave, (int)ceilf(G.wtimer)); else snprintf(b, sizeof b, "Wave %d  ·  enemies: %d", G.sv.wave, alive + G.toSpawn + G.bossLeft);
+    { char b[64]; int alive = warns_left(); for (int i = 0; i < NE; i++) if (G.en[i].alive) alive++;
+      if (G.wstate == WS_BREAK) { if (G.tut < 3) snprintf(b, sizeof b, "Wave %d  ·  break", G.sv.wave); else snprintf(b, sizeof b, "Wave %d  ·  starts in %d s", G.sv.wave, (int)ceilf(G.wtimer)); }
+      else snprintf(b, sizeof b, "Wave %d  ·  enemies: %d", G.sv.wave, alive + G.toSpawn + G.bossLeft);
       fb_text_shadow(f, b, PADW - 18, 26, 18, CREAM, 2); }
+
+    /* tutorial pill (pad side) */
+    float pillOff = 0;
+    if (G.tut < 6) {
+        static const char *pt[6] = { "TV: move Kruczek with the LEFT STICK", "Tap a spot on this map to build a Hole (4 sticks)",
+            "Gold X = buried loot. Only THIS screen can see it - guide Kruczek on the TV", "Burrows flash here BEFORE enemies climb out. Dodge with A on the TV",
+            "Loot falls onto this screen - TAP it before it breaks!", "Well done! Survive the waves and unlock new buildings" };
+        float pu = .5f + .5f * sinf(t * 5); float w = text_width(pt[G.tut], 16) + 34;
+        fb_rrect(f, PADW / 2 - w / 2 - 3, MY + 3, w + 6, 36, 18, pu > .5f ? ACCENT : INK); fb_rrect(f, PADW / 2 - w / 2, MY + 6, w, 30, 15, PANEL);
+        fb_text(f, pt[G.tut], PADW / 2, MY + 21, 16, CREAM, 1); pillOff = 40;
+    }
+    /* burrow warnings: GamePad only */
+    for (int i = 0; i < NW; i++) if (G.wn[i].alive) {
+        Warn *w = &G.wn[i]; float x = padx(w->x), y = pady(w->y), k = w->t / w->total; float pu = .5f + .5f * sinf(t * 14);
+        uint32_t c = etype_col(w->type); float big = w->type == E_FOX ? 1.5f : 1.f;
+        gfx_set_alpha(.55f + .45f * pu); fb_ring(f, x, y, (8 + 24 * k) * big, 3, c); gfx_set_alpha(1.f);
+        fb_circle(f, x, y, 5.5f * big, c); fb_text_shadow(f, w->type == E_FOX ? "BOSS!" : "!", x, y - 20 * big, w->type == E_FOX ? 18 : 20, RGB(255, 226, 110), 1);
+    }
+    /* buried treasure: GamePad only */
+    for (int i = 0; i < NTR; i++) if (G.tr[i].alive) {
+        Treasure *tr = &G.tr[i]; float x = padx(tr->x), y = pady(tr->y), pu = .5f + .5f * sinf(t * 4 + i);
+        fb_circle(f, x, y, 16 + 5 * pu, RGBA(255, 214, 90, (int)(50 + 40 * pu)));
+        gfx_set_outline(1.8f, INK); fb_line(f, x - 8, y - 8, x + 8, y + 8, 5, RGB(255, 214, 72)); fb_line(f, x - 8, y + 8, x + 8, y - 8, 5, RGB(255, 214, 72)); gfx_set_outline(0, 0);
+        if (tr->prog > 0) { fb_ring(f, x, y, 20, 3, RGBA(255, 255, 255, 200)); }
+    }
 
     /* info pill */
     if (G.infoT > 0) {
@@ -1057,24 +1310,19 @@ static void render_pad(Fb *f) {
         else if (!unlocked(G.sel)) snprintf(b, sizeof b, "%s - unlocks after wave %d", BNAME[G.sel], BREQ[G.sel]);
         else snprintf(b, sizeof b, "%s: %s", BNAME[G.sel], BDESC[G.sel]);
         float w = text_width(b, 17) + 30, a = clampf(G.infoT, 0, 1);
-        gfx_set_alpha(a * .88f); fb_rrect(f, PADW / 2 - w / 2 - 2, MY + 4, w + 4, 34, 17, INK); fb_rrect(f, PADW / 2 - w / 2, MY + 6, w, 30, 15, PANEL); gfx_set_alpha(1);
-        gfx_set_alpha(a); fb_text(f, b, PADW / 2, MY + 21, 16, CREAM, 1); gfx_set_alpha(1);
+        gfx_set_alpha(a * .88f); fb_rrect(f, PADW / 2 - w / 2 - 2, MY + 4 + pillOff, w + 4, 34, 17, INK); fb_rrect(f, PADW / 2 - w / 2, MY + 6 + pillOff, w, 30, 15, PANEL); gfx_set_alpha(1);
+        gfx_set_alpha(a); fb_text(f, b, PADW / 2, MY + 21 + pillOff, 16, CREAM, 1); gfx_set_alpha(1);
     }
 
-    /* build bar */
+    /* build bar (buttons are pre-rendered) */
     for (int i = 0; i < B_N; i++) {
         float x = btn_x(i), y = BAR_Y; int sel = (i == G.sel && !G.demolish), lock = !unlocked(i);
-        fb_rrect(f, x - 2.5f, y - 2.5f, BTN_W + 5, BAR_H + 5, 14, sel ? ACCENT : INK);
-        fb_rrect(f, x, y, BTN_W, BAR_H, 12, lock ? RGB(48, 36, 36) : (sel ? RGB(98, 70, 54) : PANEL));
-        gfx_set_alpha(lock ? .35f : 1.f); draw_building(f, i, x + 24, y + 30, 0.4f, t); gfx_set_alpha(1);
-        fb_text(f, lock ? "???" : BNAME[i], x + 46, y + 15, 15, lock ? RGB(140, 120, 112) : CREAM, 0);
-        if (lock) {
-            char b[24]; snprintf(b, sizeof b, "wave %d", BREQ[i]); fb_text(f, b, x + BTN_W / 2, y + 48, 15, RGB(176, 154, 140), 1);
-            fb_rrect(f, x + 17, y + 24, 14, 11, 3, RGB(210, 210, 214)); fb_ring(f, x + 24, y + 22, 5, 2, RGB(210, 210, 214));
-        } else {
+        if (G.tut == 1 && i == 0) { gfx_set_alpha(.4f + .5f * (.5f + .5f * sinf(t * 7))); fb_rrect(f, x - 7, y - 7, BTN_W + 14, BAR_H + 14, 18, ACCENT); gfx_set_alpha(1); }
+        blit(f, &btn_img[lock ? 2 : (sel ? 1 : 0)][i], (int)x - 4, (int)y - 4);
+        if (!lock) {
             float cx = x + 14;
             for (int k = 0; k < R_N; k++) if (BCOST[i][k] > 0) {
-                draw_res(f, k, cx, y + 49, .5f, t); char b[16]; snprintf(b, sizeof b, "%d", BCOST[i][k]);
+                char b[16]; snprintf(b, sizeof b, "%d", BCOST[i][k]);
                 fb_text(f, b, cx + 11, y + 49, 15, G.sv.res[k] >= BCOST[i][k] ? CREAM : RGB(255, 128, 110), 0); cx += 34;
             }
         }
@@ -1116,6 +1364,8 @@ static void render_pad(Fb *f) {
     if (G.curShow > 0) { fb_ring(f, G.cx, G.cy, 11, 2.6f, WHITE); fb_circle(f, G.cx, G.cy, 3, RGB(255, 214, 100)); }
 }
 
+void game_render_tv(Fb *tv) { render_tv(tv); }
+void game_render_pad(Fb *pad) { render_pad(pad); }
 void game_render(Fb *tv, Fb *pad) { render_tv(tv); render_pad(pad); }
 
 void game_init(void) {
@@ -1136,16 +1386,24 @@ void game_bot(Input *in) {
     static int fr = 0; fr++;
     memset(in, 0, sizeof *in);
     int tapnow = (fr % 5) == 0;
+    if (getenv("KR_HELP") && fr == 3) { G.mode = MODE_HELP; G.helpFrom = MODE_TITLE; }
+    if (G.mode == MODE_HELP && getenv("KR_HELP")) return;
     if (G.mode == MODE_TITLE) { if (tapnow) { in->touching = 1; in->tx = MENU_X + 20; in->ty = menu_y(0) + 20; } return; }
     if (G.mode == MODE_PAUSE) { G.mode = MODE_PLAY; return; }
     Player *p = &G.p;
+    if (G.mode == MODE_HELP) { G.mode = MODE_PLAY; return; }
     Enemy *e = nearest_enemy(p->x, p->y, 230);
     float cxm = AX + AW / 2 - p->x, cym = AY + AH / 2 - p->y, cd = sqrtf(cxm * cxm + cym * cym) + 1;
     if (e) {
         float dx = p->x - e->x, dy = p->y - e->y, d = sqrtf(dx * dx + dy * dy) + 1;
         in->lx = dx / d + cxm / cd * .5f; in->ly = dy / d + cym / cd * .5f;
         if (d < 80 && (fr % 40) == 0) in->hold |= BTN_A;
-    } else { in->lx = cxm / cd * (cd > 40); in->ly = cym / cd * (cd > 40); }
+    } else if (G.tut == 0) { in->lx = ((fr / 50) % 2) ? 1.f : -1.f; in->ly = 0; }
+    else {
+        Treasure *tt = NULL; for (int i = 0; i < NTR; i++) if (G.tr[i].alive) tt = &G.tr[i];
+        float tx = tt ? tt->x : AX + AW / 2, ty = tt ? tt->y : AY + AH / 2, ddx = tx - p->x, ddy = ty - p->y, dd = sqrtf(ddx * ddx + ddy * ddy) + 1;
+        in->lx = ddx / dd * (dd > 20); in->ly = ddy / dd * (dd > 20);
+    }
     int near = 0; for (int i = 0; i < NE; i++) if (G.en[i].alive) { float dx = G.en[i].x - p->x, dy = G.en[i].y - p->y; if (dx * dx + dy * dy < 150 * 150) near++; }
     if (near >= 3 && (fr % 30) == 0) in->hold |= BTN_B;
     if (tapnow) {
